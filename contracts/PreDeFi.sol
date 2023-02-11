@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
-import "openzeppelin-contracts/contracts/access/Ownable.sol";
-import "openzeppelin-contracts/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
 
-interface ISupraRouter {
-    function generateRequest(
-        string memory _functionSig,
-        uint8 _rngCount,
-        uint256 _numConfirmations
-    ) external returns (uint256);
+//
+interface ISupraSValueFeed {
+    function checkPrice(string memory marketPair)
+        external
+        view
+        returns (int256 price, uint256 timestamp);
 }
 
 struct Batch {
@@ -16,60 +16,60 @@ struct Batch {
     uint256 ticketCost;
     uint256 totalTickets;
     uint256 totalBalanceAfterFee;
-    uint256 currentBalance;
-    uint256 limit;
     uint256 startTimestamp;
     uint256 closeTimestamp;
-    uint256[] winNums;
+    int256 winPrice;
     address[] winners;
-    address[] claimers;
-    uint8 rngCount;
+    string pair;
     bool isClosed;
 }
 
 contract PreDeFi is Ownable {
     using Counters for Counters.Counter;
 
-    ISupraRouter internal supraRouter;
+    ISupraSValueFeed internal sValueFeed;
     Counters.Counter private _id;
     uint256 public fee; //1% = 1000
     uint256 public available;
+    address public routerAddress = 0x700a89Ba8F908af38834B9Aba238b362CFfB665F;
 
-    mapping(uint256 => uint256) private _nonceMap;
     mapping(address => mapping(uint256 => bool)) public claimed;
     mapping(uint256 => Batch) public batches;
-    mapping(uint256 => mapping(uint256 => address[])) private predictions;
-    mapping(address => mapping(uint256 => uint256[])) private activity;
+    mapping(uint256 => mapping(int256 => address[])) private predictions;
+    mapping(address => mapping(uint256 => int256[])) private activity;
+    mapping(string => bool) public isValidPair;
 
     event NewPrediction(
         uint256 id,
         uint256 indexed ticketPrice,
-        uint256 indexed limit,
-        uint8 indexed rngCount,
+        string indexed pair,
         uint256 startTimestamp,
         uint256 endTimestamp
     );
     event Predict(
         address indexed user,
         uint256 indexed id,
-        uint256[] predictions
+        int256[] predictions
     );
-    event Resolve(address indexed caller, uint256 id, uint256 generated_nonce);
-    event Execute(
-        uint256 _nonce,
-        uint256[] _rngList,
-        uint256[] winNums,
-        address[] arrWinners
+    event Resolve(
+        address indexed caller,
+        uint256 id,
+        int256 price,
+        uint256 timestamp,
+        address[] winners
     );
-    event CollectFee(address indexed wallet, uint256 avail);
+    event CollectFee(address indexed wallet, uint256 available);
     event WithdrawWin(
         address indexed caller,
         uint256 indexed id,
         uint256 amount
     );
+    event Whitelist(address indexed caller, string[] pairs);
 
-    constructor(address routerAddress) Ownable() {
-        supraRouter = ISupraRouter(routerAddress);
+    constructor(uint256 _fee, string[] memory pairs) Ownable() {
+        fee = _fee;
+        whitelist(pairs);
+        sValueFeed = ISupraSValueFeed(routerAddress);
     }
 
     modifier realId(uint256 id) {
@@ -80,11 +80,13 @@ contract PreDeFi is Ownable {
 
     function newPrediction(
         uint256 ticketCost,
-        uint256 limit,
-        uint8 rngCount,
         uint256 startsIn,
-        uint256 lastsFor
+        uint256 lastsFor,
+        string calldata pair
     ) external onlyOwner returns (uint256 id) {
+        bool valid = isValidPair[pair];
+        require(valid, "INVALID_PAIR");
+
         _id.increment();
         id = _id.current();
 
@@ -97,13 +99,12 @@ contract PreDeFi is Ownable {
         b.ticketCost = ticketCost;
         b.startTimestamp = start;
         b.closeTimestamp = end;
-        b.limit = limit;
-        b.rngCount = rngCount;
+        b.pair = pair;
 
-        emit NewPrediction(id, ticketCost, limit, rngCount, start, end);
+        emit NewPrediction(id, ticketCost, pair, start, end);
     }
 
-    function predict(uint256 id, uint256[] calldata _predictions)
+    function predict(uint256 id, int256[] calldata _predictions)
         external
         payable
         realId(id)
@@ -135,63 +136,48 @@ contract PreDeFi is Ownable {
 
     function resolve(uint256 id) external onlyOwner realId(id) {
         Batch memory b = batches[id];
+        require(block.timestamp > b.closeTimestamp, "NOT_YET");
         require(!b.isClosed, "ALREADY_RESOLVED");
+
         Batch storage _b = batches[id];
         _b.isClosed = true;
 
-        uint256 generated_nonce = supraRouter.generateRequest(
-            "execute(uint256,uint256[])",
-            b.rngCount,
-            1
-        );
-        _nonceMap[generated_nonce] = id;
-        emit Resolve(msg.sender, id, generated_nonce);
-    }
+        (int256 price, uint256 timestamp) = getPrice(b.pair);
 
-    function execute(uint256 _nonce, uint256[] calldata _rngList) external {
-        require(msg.sender == address(supraRouter));
+        // address[] memory wnrs = new address[]()
 
-        //determine total winners
-        uint256 id = _nonceMap[_nonce];
-        uint256 len = _rngList.length;
+        _b.winPrice = price;
 
-        Batch memory b = batches[id];
-        Batch storage _b = batches[id];
-
-        uint256[] memory arrNum = new uint256[](len);
-        address[] memory arrWinners;
-        uint256 k;
-
-        for (uint256 i = 0; i < len; i++) {
-            uint256 num = _rngList[i] % b.limit;
-            arrNum[i] = num;
-
-            address[] memory winnersList = predictions[id][num];
-            uint256 wLen = winnersList.length;
-
-            if (wLen > 0) {
-                for (uint256 j = 0; j < wLen; j++) {
-                    arrWinners[k] = winnersList[j];
-                    k++;
-                }
-            }
-        }
-
-        _b.winners = arrWinners;
-        _b.winNums = arrNum;
-
-        uint256 _fee = fee;
+        uint256 feeAmt;
         uint256 raised = b.ticketCost * b.totalTickets;
-        uint256 feeAmt = (raised * _fee) / (1000 * 100);
+        uint256 len = predictions[id][price].length;
+
+        if (len == 0) {
+            feeAmt = raised;
+        } else {
+            uint256 _fee = fee;
+            feeAmt = (raised * _fee) / (1000 * 100);
+
+            uint256 calc = raised - feeAmt;
+            _b.totalBalanceAfterFee = calc;
+            _b.winners = predictions[id][price];
+        }
 
         unchecked {
             available += feeAmt;
         }
 
-        uint256 calc = raised - feeAmt;
+        b = batches[id];
 
-        _b.totalBalanceAfterFee = calc;
-        emit Execute(_nonce, _rngList, arrNum, arrWinners);
+        emit Resolve(msg.sender, id, price, timestamp, b.winners);
+    }
+
+    function whitelist(string[] memory pairs) public onlyOwner {
+        uint256 len = pairs.length;
+        for (uint256 i = 0; i < len; i++) {
+            isValidPair[pairs[i]] = true;
+        }
+        emit Whitelist(msg.sender, pairs);
     }
 
     function collectFee(address payable wallet) external onlyOwner {
@@ -212,6 +198,8 @@ contract PreDeFi is Ownable {
         Batch memory b = batches[id];
         uint256 amt = (b.totalBalanceAfterFee / b.winners.length) * count;
 
+        claimed[msg.sender][id] = true;
+
         _transfer(payable(msg.sender), amt);
         emit WithdrawWin(msg.sender, id, amt);
     }
@@ -220,7 +208,7 @@ contract PreDeFi is Ownable {
         public
         view
         realId(id)
-        returns (bool, uint256)
+        returns (bool isWinner, uint256 winTickets)
     {
         Batch memory b = batches[id];
         uint256 len = b.winners.length;
@@ -230,10 +218,17 @@ contract PreDeFi is Ownable {
                 if (b.winners[i] == addr) num++;
             }
             if (num > 0) {
-                return (true, num);
+                (isWinner, winTickets) = (true, num);
             }
         }
-        return (false, 0);
+    }
+
+    function getPrice(string memory pair)
+        public
+        view
+        returns (int256 price, uint256 timestamp)
+    {
+        return sValueFeed.checkPrice(pair);
     }
 
     function _transfer(address payable wallet, uint256 amt) private {
