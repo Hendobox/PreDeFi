@@ -2,8 +2,6 @@
 
 A decentralized prediction market.
 
-[FRONTEND REPOSITORY](https://github.com/laviedegeorge/web3-prediction-game)
-
 [DEPLOYED CONTRACT](https://explorer.testnet.mantle.xyz/address/0x58Bf9088F1609190B6cE6b3C79343516Fd475723)
 
 ## OVERVIEW
